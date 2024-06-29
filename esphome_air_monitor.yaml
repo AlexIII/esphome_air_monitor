@@ -1,0 +1,325 @@
+substitutions:
+  metrics_source_name: node1
+  metrics_url: https://influx-prod-24-prod-eu-west-2.grafana.net/api/v1/push/influx/write
+  metrics_api_key: <PrometheusLogin>:<PrometheusApiKey>
+
+globals:
+  - id: mq135_ppm_no_correction
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: mq135_v0  # voltage at R0 (100ppm)
+    type: float
+    restore_value: yes
+    initial_value: '0'
+
+esphome:
+  name: ${metrics_source_name}
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: DEBUG
+
+ota:
+  password: ""
+
+wifi:
+  ssid: "MyNetworkName"
+  password: "MyPassword"
+  manual_ip:
+    static_ip: 192.168.0.115
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+    dns1: 1.1.1.1
+    dns2: 8.8.8.8
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "N1 Fallback Hotspot"
+    password: "0987654321"
+
+captive_portal:
+
+web_server:
+  port: 80
+  local: true
+
+http_request:
+  useragent: esphome/device
+  timeout: 10s
+
+# Hardware
+uart:
+  rx_pin: GPIO16
+  tx_pin: GPIO17
+  baud_rate: 9600
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: false
+
+# esp32_ble_tracker:
+#   scan_parameters:
+#     interval: 300ms
+#     window: 300ms
+#     active: false
+
+bme680_bsec:
+  address: 0x77
+
+sensor:
+  # CO2 indoor sensor
+  - platform: mhz19
+    co2:
+      name: "Indoor CO2 [MH-Z19]"
+      id: mhz19_co2
+    update_interval: 20s
+    automatic_baseline_calibration: false
+
+  # Not enough memory to support BLE sensor. HTTPS needs to be disabled to use this sensor.
+  # # Xiaomi portable BLE sensor
+  # - platform: xiaomi_lywsd03mmc
+  #   mac_address: "A4:C1:38:0E:2E:CF"
+  #   bindkey: "24f0d929b025b305f56b8f70e0ec609a"
+  #   temperature:
+  #     name: "LYWSD03MMC Temperature"
+  #     id: xi1_temp
+  #   humidity:
+  #     name: "LYWSD03MMC Humidity"
+  #     id: xi1_hum
+  #   battery_level:
+  #     name: "LYWSD03MMC Battery Level"
+
+  # Wired indoor temperature and humidity sensor
+  - platform: dht
+    pin: GPIO23
+    temperature:
+      name: "Indoor Temperature [DHT-11]"
+      id: dht_indoor_temp
+      filters:
+        - lambda: |-
+            const uint16_t t = x * 10.0F;
+            const float tempFixed = (t & 0x8000? -0.1F : 0.1F) * float(t & 0x7FFF);
+            if(!(tempFixed > -80.f && tempFixed < 120.f)) {
+              return NAN;
+            }
+            return tempFixed;
+    humidity:
+      name: "Indoor Humidity [DHT-11]"
+      id: dht_indoor_hum
+    update_interval: 10s
+
+  # Wired outdoor temperature and humidity sensor
+  # - platform: dht
+  #   pin: GPIO22
+  #   temperature:
+  #     name: "Outdoor Temperature [DHT-11]"
+  #     id: dht_outdoor_temp
+  #     filters:
+  #       - lambda: |-
+  #           const uint16_t t = x * 10.0F;
+  #           return (t & 0x8000? -0.1F : 0.1F) * float(t & 0x7FFF);
+  #   humidity:
+  #     name: "Outdoor Humidity [DHT-11]"
+  #     id: 
+  #   update_interval: 10s
+
+  # Power supply voltage
+  - platform: adc
+    pin: A3
+    attenuation: 11db
+    name: "External Voltage"
+    unit_of_measurement: "V"
+    id: ext_voltage
+    update_interval: 5s
+    filters:
+      - multiply: 1.98
+      - sliding_window_moving_average:
+          window_size: 15
+          send_every: 5
+
+  # Wired outdoor MQ-135 air quality sensor
+  - platform: adc
+    pin: A0
+    attenuation: 2.5db
+    accuracy_decimals: 3
+    name: "MQ-135 ADC"
+    id: mq135_outdoor_v
+    update_interval: 5s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 15
+          send_every: 3
+  # MQ-135 V0
+  - platform: template
+    accuracy_decimals: 3
+    name: "MQ-135 V0"
+    unit_of_measurement: "V"
+    lambda: return id(mq135_v0);
+  # MQ-135 ppm (corrected)
+  - platform: template
+    name: "NH4 corrected [MQ-135]"
+    unit_of_measurement: "ppm"
+    id: mq135_outdoor_NH4_corr
+    lambda: |-
+      const float Vs = id(mq135_outdoor_v).state;
+      // Calibrate V0
+      const bool V0_valid = id(mq135_v0) > 0.01 && id(mq135_v0) < 2.0;
+      if(!V0_valid) {
+        if(millis() < 32000) return 0;
+        id(mq135_v0) = Vs;
+        ESP_LOGD("MQ135", "Calibrated V0=%f", Vs);
+      }
+      // Calculate Rs/R0
+      const float Vcc = id(ext_voltage).state;
+      const float V0 = id(mq135_v0); // voltage at R0 (100ppm)
+      const float RsR0 = (V0 * (Vcc - Vs)) / (Vs * (Vcc - V0));
+      // Temperature and humidity correction model
+      const float CORA = 0.00035;
+      const float CORB = 0.02718;
+      const float CORC = 1.39538;
+      const float CORD = 0.0018;
+      const float t = id(bme680_outdoor_temp).state;
+      const float h = id(bme680_outdoor_hum).state;
+      const float corr = CORA * t * t - CORB * t + CORC - (h-33.)*CORD;
+      // Regression model
+      const float a = 102.2; // NH4
+      const float b = -2.473; // NH4
+      const float ppm = a*pow(RsR0 + corr, b);
+      // No correction
+      id(mq135_ppm_no_correction) = a*pow(RsR0, b);
+      return ppm;
+    update_interval: 10s
+  # MQ-135 ppm (no correction)
+  - platform: template
+    name: "NH4 [MQ-135]"
+    unit_of_measurement: "ppm"
+    id: mq135_outdoor_NH4
+    lambda: return id(mq135_ppm_no_correction);
+    update_interval: 10s
+
+  # Wired outdoor BME680
+  - platform: bme680_bsec
+    temperature:
+      name: "Outdoor Temperature [BME680]"
+      id: bme680_outdoor_temp
+    pressure:
+      name: "Outdoor Pressure [BME680]"
+      id: bme680_outdoor_pres
+      filters:
+        - multiply: 0.750062
+      unit_of_measurement: "mmHg"
+      accuracy_decimals: 2
+    humidity:
+      name: "Outdoor Humidity [BME680]"
+      id: bme680_outdoor_hum
+    gas_resistance:
+      name: "Outdoor Gas sensor (resistance) [BME680]"
+      id: bme680_outdoor_gas_res
+      filters:
+        - median
+    iaq:
+      name: "Outdoor Air Quality (BSEC) [BME680]"
+      id: bme680_outdoor_aqi
+      filters:
+        - median
+    iaq_accuracy:
+      name: "Outdoor Air Quality Accuracy (BSEC) [BME680]"
+
+# Buttons
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO14
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Reset MQ135 V0"
+    on_press:
+      then:
+        lambda: |-
+          id(mq135_v0) = 0;
+          ESP_LOGD("MQ135", "Reset V0");
+
+# Report
+interval:
+  - interval: 30sec
+    then:
+      - http_request.post:
+          url: ${metrics_url}
+          headers:
+            Content-Type: text/plain
+            Authorization: Bearer ${metrics_api_key}
+          body: !lambda |-
+            std::string body;
+            const int reserveSize = 2048;
+            body.reserve(reserveSize);
+            // indoor
+            if(isfinite(id(dht_indoor_temp).state)) {
+              body += "temperature_celsius,location=indoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(dht_indoor_temp).state);
+              body += "\n";
+            }
+            if(isfinite(id(dht_indoor_hum).state)) {
+              body += "humidity_pct,location=indoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(dht_indoor_hum).state);
+              body += "\n";
+            }
+            if(isfinite(id(mhz19_co2).state)) {
+              body += "co2_ppm,location=indoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(mhz19_co2).state);
+              body += "\n";
+            // outdoor
+            }
+            if(isfinite(id(bme680_outdoor_temp).state)) {
+              body += "temperature_celsius,location=outdoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(bme680_outdoor_temp).state);
+              body += "\n";
+            }
+            if(isfinite(id(bme680_outdoor_hum).state)) {
+              body += "humidity_pct,location=outdoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(bme680_outdoor_hum).state);
+              body += "\n";
+            }
+            if(isfinite(id(mq135_outdoor_v).state)) {
+              body += "nh4_v,location=outdoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(mq135_outdoor_v).state);
+              body += "\n";
+            }
+            if(isfinite(id(mq135_outdoor_NH4).state)) {
+              body += "nh4_ppm,location=outdoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(mq135_outdoor_NH4).state);
+              body += "\n";
+            }
+            if(isfinite(id(mq135_outdoor_NH4_corr).state)) {
+              body += "nh4_corr_ppm,location=outdoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(mq135_outdoor_NH4_corr).state);
+              body += "\n";
+            }
+            if(isfinite(id(bme680_outdoor_pres).state)) {
+              body += "pres_mmHg,location=outdoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(bme680_outdoor_pres).state);
+              body += "\n";
+            }
+            if(isfinite(id(bme680_outdoor_gas_res).state)) {
+              body += "bme680_res,location=outdoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(bme680_outdoor_gas_res).state);
+              body += "\n";
+            }
+            if(isfinite(id(bme680_outdoor_aqi).state)) {
+              body += "bme680_aqi,location=outdoor,source=${metrics_source_name} metric=";
+              body += std::to_string(id(bme680_outdoor_aqi).state);
+              body += "\n";
+            }
+            if(body.size() + 1 > reserveSize) {
+              ESP_LOGW("HTTP POST", "Reserved string size is not enough! %i %i", body.size() + 1, reserveSize);
+            }
+            return body;
+          verify_ssl: false
+
